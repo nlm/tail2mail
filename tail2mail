@@ -1,0 +1,164 @@
+#!/usr/bin/perl -w
+#
+#    tail2mail: periodically send new entries in file by mail
+#    Copyright (C) 2012 Nicolas Limage
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+use strict;
+use File::Tail;
+use File::Basename;
+use Mail::Mailer;
+use Getopt::Long;
+use Sys::Hostname;
+
+my $BUFFER;
+my $SELECT_DELAY = 10;
+my $MAIL_DELAY = 600;
+my $VERBOSE = 0;
+my $BASENAME = basename($0);
+
+sub usage()
+{
+	print("usage: $BASENAME [OPTIONS] <file> [<file> [...]]\n");
+	print <<EOF
+watches many files and send new content via mail
+OPTIONS:
+	-r|--recipient <email>		address of the recipient. can be used multiple time. there must be at least one.
+	-s|--sender <email>		address of the sender (default: \$USER\@\$HOSTNAME)
+	-t|--transport <host>		hostname or IP of the SMTP relay (default: send via sendmail)
+	-d|--delay <duration>		delay between mails
+	-u|--subject <subject>		subject of the mail (default: [tail2mail] Report for \$hostname : \$files ...)
+	-v|--verbose			be more verbose
+EOF
+;
+
+}
+
+sub buf2mail($$$$$)
+{
+	my ($sender, $recipients, $subject, $mailer, $buffer) = @_;
+	my $msg = '';
+	my @fnames;
+
+	foreach (keys %$buffer)
+	{
+		if ($buffer->{$_} ne '')
+		{
+			$msg .= "----- $_ -----\n" .  $buffer->{$_} . "\n";
+			$buffer->{$_} = '';
+			push @fnames, $_;
+		}
+	}
+
+	if ($msg ne '')
+	{
+		print("[+] sending mail\n") if $VERBOSE;
+
+		if (!defined $subject)
+		{
+			$subject = '[tail2mail] Report for ' . hostname . ' : ' . join(' ', @fnames);
+		}
+
+		$mailer->open({
+			To => $recipients,
+			From => $sender,
+			Subject => $subject
+		});
+
+		print $mailer $msg;
+		$mailer->close or warn "[!] could not send whole message: $!\n";
+	}
+}
+
+### Options Parsing ###
+
+my ($smtp, $sender, $subject, $recipients);
+my $result = GetOptions(
+	"t|transport=s" => \$smtp,
+	"d|delay=i" => \$MAIL_DELAY,
+	"s|sender=s" => \$sender,
+	"r|recipient=s@" => \$recipients,
+	"u|subject=s" => \$subject,
+	"v|verbose" => \$VERBOSE
+);
+
+if (!$result) { usage(); exit(1); }
+if (@ARGV < 1) { usage(); exit(1); }
+
+if ($MAIL_DELAY < 30) { print("[-] delay must be >= 30\n"); exit(1); }
+if (!defined $sender) { $sender = $ENV{'USER'} . '@' . hostname; }
+if (!defined $recipients || @$recipients eq 0) { print("[-] there must be at least one recipient\n"); exit(1); }
+
+print("[+] sending from $sender\n") if ($VERBOSE);
+if ($VERBOSE) { print("[+] sending to $_\n") foreach (@$recipients) }
+print("[+] delay between mails: $MAIL_DELAY seconds\n") if ($VERBOSE);
+
+### Mail ###
+
+my $mailer;
+if (defined $smtp)
+{
+	print("[+] sending via $smtp\n") if ($VERBOSE);
+	$mailer = Mail::Mailer->new('smtp', Server => $smtp);
+}
+else
+{
+	print("[+] sending using sendmail\n") if ($VERBOSE);
+	$mailer = Mail::Mailer->new('sendmail'); 
+}
+
+### Files to Watch ###
+
+my @logfiles = @ARGV;
+my $logfile = join(", ", @logfiles);
+
+my @fhs;
+foreach (@logfiles)
+{
+	if (!-f $_)
+	{
+		print("[!] skipping non-existent file: $_\n");
+	}
+	else
+	{
+		print("[+] watching $_\n") if ($VERBOSE);
+		push(@fhs, File::Tail->new(name => $_, debug => 0));
+		$BUFFER->{$_} = '';
+	}
+}
+
+if (!@fhs)
+{
+	print("[-] no files to watch\n");
+	exit(1);
+}
+
+
+### Tailing ###
+
+my $lastdump = time();
+my ($nfound, $timeleft, @pending);
+while (1)
+{
+	($nfound, $timeleft, @pending) = File::Tail::select(undef, undef, undef, $SELECT_DELAY, @fhs);
+	if ($nfound) { foreach (@pending) { $BUFFER->{$_->{'input'}} .= $_->read; } }
+
+	### Send mail periodically ###
+	if (time() > $lastdump + $MAIL_DELAY)
+	{
+		buf2mail($sender, $recipients, $subject, $mailer, $BUFFER);
+		$lastdump = time();
+	}
+}
